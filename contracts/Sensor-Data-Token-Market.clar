@@ -9,6 +9,9 @@
 (define-constant ERR_ACCESS_EXPIRED (err u411))
 (define-constant ERR_SENSOR_ALREADY_EXISTS (err u409))
 (define-constant ERR_INVALID_PRICE (err u402))
+(define-constant ERR_NO_ACCESS (err u412))
+(define-constant ERR_ALREADY_RATED (err u413))
+(define-constant ERR_INVALID_RATING (err u414))
 
 (define-data-var next-sensor-id uint u1)
 (define-data-var platform-fee-rate uint u250)
@@ -59,6 +62,25 @@
   }
 )
 
+(define-map sensor-reputation
+  { sensor-id: uint }
+  {
+    total-ratings: uint,
+    total-score: uint,
+    average-rating: uint,
+    uptime-percentage: uint,
+    total-data-published: uint
+  }
+)
+
+(define-map buyer-ratings
+  { buyer: principal, sensor-id: uint }
+  {
+    rating: uint,
+    rated-at: uint
+  }
+)
+
 (define-public (register-sensor (location (string-ascii 50)) (sensor-type (string-ascii 30)) (price-per-hour uint) (public-key (buff 33)))
   (let
     (
@@ -89,6 +111,17 @@
       }
     )
     
+    (map-set sensor-reputation
+      { sensor-id: sensor-id }
+      {
+        total-ratings: u0,
+        total-score: u0,
+        average-rating: u0,
+        uptime-percentage: u100,
+        total-data-published: u0
+      }
+    )
+    
     (var-set next-sensor-id (+ sensor-id u1))
     (ok sensor-id)
   )
@@ -112,6 +145,16 @@
         data-size: data-size,
         verified: true
       }
+    )
+    
+    (let
+      (
+        (reputation (default-to { total-ratings: u0, total-score: u0, average-rating: u0, uptime-percentage: u100, total-data-published: u0 } (map-get? sensor-reputation { sensor-id: sensor-id })))
+      )
+      (map-set sensor-reputation
+        { sensor-id: sensor-id }
+        (merge reputation { total-data-published: (+ (get total-data-published reputation) u1) })
+      )
     )
     
     (ok true)
@@ -274,6 +317,68 @@
     (match sensor
       s (secp256k1-verify data-hash signature (get public-key s))
       false
+    )
+  )
+)
+
+(define-public (rate-sensor (sensor-id uint) (rating uint))
+  (let
+    (
+      (sensor (unwrap! (map-get? sensors { sensor-id: sensor-id }) ERR_SENSOR_NOT_FOUND))
+      (access (unwrap! (map-get? access-rights { buyer: tx-sender, sensor-id: sensor-id }) ERR_NO_ACCESS))
+      (existing-rating (map-get? buyer-ratings { buyer: tx-sender, sensor-id: sensor-id }))
+      (reputation (default-to { total-ratings: u0, total-score: u0, average-rating: u0, uptime-percentage: u100, total-data-published: u0 } (map-get? sensor-reputation { sensor-id: sensor-id })))
+      (current-block burn-block-height)
+    )
+    (asserts! (is-none existing-rating) ERR_ALREADY_RATED)
+    (asserts! (and (>= rating u1) (<= rating u5)) ERR_INVALID_RATING)
+    (asserts! (< current-block (get expires-at access)) ERR_ACCESS_EXPIRED)
+    
+    (let
+      (
+        (new-total-ratings (+ (get total-ratings reputation) u1))
+        (new-total-score (+ (get total-score reputation) rating))
+        (new-average-rating (/ new-total-score new-total-ratings))
+      )
+      (map-set sensor-reputation
+        { sensor-id: sensor-id }
+        (merge reputation {
+          total-ratings: new-total-ratings,
+          total-score: new-total-score,
+          average-rating: new-average-rating
+        })
+      )
+    )
+    
+    (map-set buyer-ratings
+      { buyer: tx-sender, sensor-id: sensor-id }
+      {
+        rating: rating,
+        rated-at: current-block
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-read-only (get-sensor-reputation (sensor-id uint))
+  (map-get? sensor-reputation { sensor-id: sensor-id })
+)
+
+(define-read-only (get-buyer-rating (buyer principal) (sensor-id uint))
+  (map-get? buyer-ratings { buyer: buyer, sensor-id: sensor-id })
+)
+
+(define-read-only (get-sensor-with-reputation (sensor-id uint))
+  (let
+    (
+      (sensor (map-get? sensors { sensor-id: sensor-id }))
+      (reputation (map-get? sensor-reputation { sensor-id: sensor-id }))
+    )
+    (match sensor
+      s (some { sensor: s, reputation: reputation })
+      none
     )
   )
 )
