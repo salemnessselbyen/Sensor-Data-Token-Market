@@ -12,6 +12,8 @@
 (define-constant ERR_NO_ACCESS (err u412))
 (define-constant ERR_ALREADY_RATED (err u413))
 (define-constant ERR_INVALID_RATING (err u414))
+(define-constant ERR_INVALID_DISCOUNT (err u415))
+(define-constant ERR_TIER_NOT_FOUND (err u416))
 
 (define-data-var next-sensor-id uint u1)
 (define-data-var platform-fee-rate uint u250)
@@ -79,6 +81,20 @@
     rating: uint,
     rated-at: uint
   }
+)
+
+(define-map discount-tiers
+  { sensor-id: uint, tier-id: uint }
+  {
+    min-hours: uint,
+    discount-rate: uint,
+    active: bool
+  }
+)
+
+(define-map sensor-tier-count
+  { sensor-id: uint }
+  { count: uint }
 )
 
 (define-public (register-sensor (location (string-ascii 50)) (sensor-type (string-ascii 30)) (price-per-hour uint) (public-key (buff 33)))
@@ -165,41 +181,49 @@
   (let
     (
       (sensor (unwrap! (map-get? sensors { sensor-id: sensor-id }) ERR_SENSOR_NOT_FOUND))
-      (total-cost (* (get price-per-hour sensor) duration-hours))
-      (platform-fee (/ (* total-cost (var-get platform-fee-rate)) u10000))
-      (seller-amount (- total-cost platform-fee))
-      (current-block burn-block-height)
-      (expires-at (+ current-block (* duration-hours u6)))
     )
     (asserts! (get active sensor) ERR_SENSOR_NOT_FOUND)
     (asserts! (> duration-hours u0) ERR_INVALID_PRICE)
     
-    (try! (ft-transfer? data-access-token total-cost tx-sender CONTRACT_OWNER))
-    (try! (ft-transfer? data-access-token seller-amount CONTRACT_OWNER (get owner sensor)))
-    
-    (map-set access-rights
-      { buyer: tx-sender, sensor-id: sensor-id }
-      {
-        expires-at: expires-at,
-        purchased-at: current-block,
-        amount-paid: total-cost
-      }
+    (let
+      (
+        (base-cost (* (get price-per-hour sensor) duration-hours))
+        (discount (get-best-discount sensor-id duration-hours))
+        (discount-amount (/ (* base-cost discount) u10000))
+        (total-cost (- base-cost discount-amount))
+        (platform-fee (/ (* total-cost (var-get platform-fee-rate)) u10000))
+        (seller-amount (- total-cost platform-fee))
+        (current-block burn-block-height)
+        (expires-at (+ current-block (* duration-hours u6)))
+      )
+      
+      (try! (ft-transfer? data-access-token total-cost tx-sender CONTRACT_OWNER))
+      (try! (ft-transfer? data-access-token seller-amount CONTRACT_OWNER (get owner sensor)))
+      
+      (map-set access-rights
+        { buyer: tx-sender, sensor-id: sensor-id }
+        {
+          expires-at: expires-at,
+          purchased-at: current-block,
+          amount-paid: total-cost
+        }
+      )
+      
+      (map-set sensors
+        { sensor-id: sensor-id }
+        (merge sensor { total-earned: (+ (get total-earned sensor) seller-amount) })
+      )
+      
+      (map-set buyer-stats
+        { buyer: tx-sender }
+        {
+          total-spent: (+ total-cost (get total-spent (default-to { total-spent: u0, active-subscriptions: u0 } (map-get? buyer-stats { buyer: tx-sender })))),
+          active-subscriptions: (+ u1 (get active-subscriptions (default-to { total-spent: u0, active-subscriptions: u0 } (map-get? buyer-stats { buyer: tx-sender }))))
+        }
+      )
+      
+      (ok expires-at)
     )
-    
-    (map-set sensors
-      { sensor-id: sensor-id }
-      (merge sensor { total-earned: (+ (get total-earned sensor) seller-amount) })
-    )
-    
-    (map-set buyer-stats
-      { buyer: tx-sender }
-      {
-        total-spent: (+ total-cost (get total-spent (default-to { total-spent: u0, active-subscriptions: u0 } (map-get? buyer-stats { buyer: tx-sender })))),
-        active-subscriptions: (+ u1 (get active-subscriptions (default-to { total-spent: u0, active-subscriptions: u0 } (map-get? buyer-stats { buyer: tx-sender }))))
-      }
-    )
-    
-    (ok expires-at)
   )
 )
 
@@ -214,6 +238,55 @@
     (map-set sensors
       { sensor-id: sensor-id }
       (merge sensor { price-per-hour: new-price })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (set-discount-tier (sensor-id uint) (tier-id uint) (min-hours uint) (discount-rate uint))
+  (let
+    (
+      (sensor (unwrap! (map-get? sensors { sensor-id: sensor-id }) ERR_SENSOR_NOT_FOUND))
+      (tier-count (get count (default-to { count: u0 } (map-get? sensor-tier-count { sensor-id: sensor-id }))))
+    )
+    (asserts! (is-eq tx-sender (get owner sensor)) ERR_NOT_AUTHORIZED)
+    (asserts! (> min-hours u0) ERR_INVALID_DISCOUNT)
+    (asserts! (<= discount-rate u5000) ERR_INVALID_DISCOUNT)
+    (asserts! (or (< tier-id tier-count) (is-eq tier-id tier-count)) ERR_TIER_NOT_FOUND)
+    
+    (map-set discount-tiers
+      { sensor-id: sensor-id, tier-id: tier-id }
+      {
+        min-hours: min-hours,
+        discount-rate: discount-rate,
+        active: true
+      }
+    )
+    
+    (if (is-eq tier-id tier-count)
+      (map-set sensor-tier-count
+        { sensor-id: sensor-id }
+        { count: (+ tier-count u1) }
+      )
+      true
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (remove-discount-tier (sensor-id uint) (tier-id uint))
+  (let
+    (
+      (sensor (unwrap! (map-get? sensors { sensor-id: sensor-id }) ERR_SENSOR_NOT_FOUND))
+      (tier (unwrap! (map-get? discount-tiers { sensor-id: sensor-id, tier-id: tier-id }) ERR_TIER_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get owner sensor)) ERR_NOT_AUTHORIZED)
+    
+    (map-set discount-tiers
+      { sensor-id: sensor-id, tier-id: tier-id }
+      (merge tier { active: false })
     )
     
     (ok true)
@@ -249,6 +322,40 @@
     (asserts! (<= new-fee-rate u1000) ERR_INVALID_PRICE)
     (var-set platform-fee-rate new-fee-rate)
     (ok true)
+  )
+)
+
+(define-private (get-best-discount (sensor-id uint) (duration-hours uint))
+  (let
+    (
+      (tier0 (map-get? discount-tiers { sensor-id: sensor-id, tier-id: u0 }))
+      (tier1 (map-get? discount-tiers { sensor-id: sensor-id, tier-id: u1 }))
+      (tier2 (map-get? discount-tiers { sensor-id: sensor-id, tier-id: u2 }))
+      (tier3 (map-get? discount-tiers { sensor-id: sensor-id, tier-id: u3 }))
+      (tier4 (map-get? discount-tiers { sensor-id: sensor-id, tier-id: u4 }))
+    )
+    (let
+      (
+        (disc0 (match tier0 t (if (and (get active t) (>= duration-hours (get min-hours t))) (get discount-rate t) u0) u0))
+        (disc1 (match tier1 t (if (and (get active t) (>= duration-hours (get min-hours t))) (get discount-rate t) u0) u0))
+        (disc2 (match tier2 t (if (and (get active t) (>= duration-hours (get min-hours t))) (get discount-rate t) u0) u0))
+        (disc3 (match tier3 t (if (and (get active t) (>= duration-hours (get min-hours t))) (get discount-rate t) u0) u0))
+        (disc4 (match tier4 t (if (and (get active t) (>= duration-hours (get min-hours t))) (get discount-rate t) u0) u0))
+      )
+      (let
+        (
+          (max01 (if (> disc1 disc0) disc1 disc0))
+          (max23 (if (> disc3 disc2) disc3 disc2))
+        )
+        (let
+          (
+            (max014 (if (> disc4 max01) disc4 max01))
+            (max23f max23)
+          )
+          (if (> max23f max014) max23f max014)
+        )
+      )
+    )
   )
 )
 
@@ -297,7 +404,8 @@
   (map-get? buyer-stats { buyer: buyer })
 )
 
-(define-read-only (calculate-access-cost (sensor-id uint) (duration-hours uint))
+
+(define-read-only (calculate-base-cost (sensor-id uint) (duration-hours uint))
   (let
     (
       (sensor (map-get? sensors { sensor-id: sensor-id }))
@@ -308,6 +416,7 @@
     )
   )
 )
+
 
 (define-read-only (verify-data-signature (sensor-id uint) (data-hash (buff 32)) (signature (buff 65)))
   (let
@@ -382,3 +491,12 @@
     )
   )
 )
+
+(define-read-only (get-discount-tier (sensor-id uint) (tier-id uint))
+  (map-get? discount-tiers { sensor-id: sensor-id, tier-id: tier-id })
+)
+
+(define-read-only (get-sensor-tier-count (sensor-id uint))
+  (get count (default-to { count: u0 } (map-get? sensor-tier-count { sensor-id: sensor-id })))
+)
+
